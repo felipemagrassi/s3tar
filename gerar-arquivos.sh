@@ -3,8 +3,8 @@
 PROJECTS=("a/a_short" "b/b_short")
 OBJECTS=("Account" "Case")
 YEARS=("2024" "2025")
-MONTHS=("01" "02" "11")
-DAYS=("01" "02" "30")
+MONTHS=("1" "2" "11")
+DAYS=("1" "2" "3" "27")
 
 # Create base directories
 for project in "${PROJECTS[@]}"; do
@@ -12,7 +12,11 @@ for project in "${PROJECTS[@]}"; do
             for year in "${YEARS[@]}"; do
                 for month in "${MONTHS[@]}"; do
                     for day in "${DAYS[@]}"; do
-                        mkdir -p "s3/raw/$project/$object/year=$year/month=$month/day=$day/appflow"
+                        if [ "$day" = "3" ]; then
+                            mkdir -p "s3/raw/$project/$object/year=$year/month=$month/day=$day"
+                        else
+                            mkdir -p "s3/raw/$project/$object/year=$year/month=$month/day=$day/appflow"
+                        fi
                     done
                 done
             done
@@ -26,6 +30,9 @@ for project in "${PROJECTS[@]}"; do
             for year in "${YEARS[@]}"; do
                 for month in "${MONTHS[@]}"; do
                     for day in "${DAYS[@]}"; do
+                        if [ "$day" = "3" ]; then
+                            continue
+                        fi
                         for i in {1..25}; do
                             base64 /dev/urandom | head -c 209715 > "s3/raw/$project/$object/year=$year/month=$month/day=$day/appflow/account_${i}.txt"
                         done
