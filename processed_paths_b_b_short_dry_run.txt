@@ -1,0 +1,8 @@
+b_b_short:Account:2024:01:01:IGNORED_RULE_1
+b_b_short:Account:2024:01:02
+b_b_short:Account:2024:01:30
+b_b_short:Account:2024:01:ALL
+b_b_short:Account:2024:02:01:IGNORED_RULE_1
+b_b_short:Account:2024:02:02
+b_b_short:Account:2024:02:30:IGNORED_RULE_90
+b_b_short:Account:2024:02:ALL
