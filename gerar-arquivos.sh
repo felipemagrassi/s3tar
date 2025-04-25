@@ -1,10 +1,10 @@
 #!/bin/bash
 
-PROJECTS=("a/a_short" "b/b_short")
-OBJECTS=("Account" "Case")
+PROJECTS=("b/b_short")
+OBJECTS=("Account" "Lead" "Contact")
 YEARS=("2024" "2025")
-MONTHS=("1" "2" "11")
-DAYS=("1" "2" "3" "27")
+MONTHS=("1" "11")
+DAYS=("1" "27")
 
 # Create base directories
 for project in "${PROJECTS[@]}"; do
@@ -33,8 +33,8 @@ for project in "${PROJECTS[@]}"; do
                         if [ "$day" = "3" ]; then
                             continue
                         fi
-                        for i in {1..25}; do
-                            base64 /dev/urandom | head -c 209715 > "s3/raw/$project/$object/year=$year/month=$month/day=$day/appflow/account_${i}.txt"
+                        for i in {1..100}; do
+                            base64 /dev/urandom | head -c 100 > "s3/raw/$project/$object/year=$year/month=$month/day=$day/appflow/account_${i}.txt"
                         done
                     done
                 done
