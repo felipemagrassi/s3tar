@@ -1,15 +1,33 @@
 import logging
 import boto3
 import botocore
+import sqlite3
 import argparse
-import hashlib
 import os
-import json
 import subprocess
 import csv
-import re
 from collections import deque
+import json
 from datetime import datetime
+class Config:
+    def __init__(self):
+        self.bucket = None
+        self.region = None
+        self.profile = None
+        self.delete = False
+        self.dry_run = False
+        self.deep_archive = False
+
+    def load(self, args: argparse.Namespace):
+        self.bucket = args.bucket
+        self.region = args.region
+        self.profile = args.profile
+        self.delete = args.delete
+        self.dry_run = args.dry_run
+        self.deep_archive = args.deep_archive
+
+    def __str__(self):
+        return f"Config(bucket={self.bucket}, region={self.region}, profile={self.profile}, delete={self.delete}, dry_run={self.dry_run}, deep_archive={self.deep_archive})"
 
 
 logging.basicConfig(
@@ -20,7 +38,6 @@ logging.getLogger("boto3").setLevel(logging.WARNING)
 logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-
 
 def log_debug(message: str) -> None:
     logging.debug(f"🔍 DEBUG: {message}")
@@ -54,6 +71,7 @@ def archive_object(
     src_csv_path: str,
     deep_archive: bool,
     dry_run: bool,
+    s3client: boto3.client,
 ) -> bool:
     """
     Archive objects listed in a CSV file into a TAR archive
@@ -71,20 +89,33 @@ def archive_object(
         bool: True if successful, False otherwise
     """
     full_dst_path = f"s3://{bucket}/{dst_path}"
-    
+
+    try:
+        s3client.head_object(Bucket=bucket, Key=full_dst_path)
+        log_info(f"Arquivo {full_dst_path} já existe, pulando")
+        return True
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            log_info(f"Arquivo {full_dst_path} não existe, criando")
+        else:
+            log_error(f"Erro ao verificar se o arquivo existe: {e}")
+            return False
+
     if dry_run:
         log_dry_run(f"Simulating archiving objects from {src_csv_path} to {full_dst_path}")
         return True
 
     cmd = [
         "s3tar",
-        "--region",
-        region,
         "-vvv",
         "-c",
         "-f",
         full_dst_path,
+        "--region",
+        region,
         "--concat-in-memory",
+        "-m",
+        src_csv_path,
     ]
     
     if deep_archive:
@@ -94,20 +125,16 @@ def archive_object(
     if profile:
         cmd.append("--profile")
         cmd.append(profile)
-        
-    # Use the CSV file as a manifest
-    cmd.append("-m")
-    cmd.append(src_csv_path)
 
     try:
-        log_info(f"Running command: {' '.join(cmd)}")
+        log_info(f"Executando comando: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
-        log_success(f"Archived objects from {src_csv_path} to {full_dst_path}")
+        log_success(f"Arquivos de {src_csv_path} para {full_dst_path} arquivados com sucesso")
         return True
     except subprocess.CalledProcessError as e:
-        log_error(f"Error archiving objects from {src_csv_path}: {e}")
+        log_error(f"Erro ao arquivar arquivos de {src_csv_path}: {e}")
+        log_error(e.stderr)
         return False
-
 
 def delete_object(
     s3client: boto3.client, bucket: str, src_path: str, delete: bool, dry_run: bool
@@ -120,46 +147,131 @@ def delete_object(
         log_warning(f"Deleção nao habilitada, ignorando {src_path}")
         return False
 
+    log_info(f"Excluindo {src_path}")
+
     try:
-        objects = []
-        paginator = s3client.get_paginator("list_objects_v2")
-        page_iterator = paginator.paginate(Bucket=bucket, Prefix=src_path)
+        with open(src_path, 'r') as csv_file:
+            csv_reader = csv.reader(csv_file)
+            objects_batch = []
+            batch_size = 1000
+            
+            for row in csv_reader:
+                if not row:
+                    continue
 
-        for page in page_iterator:
-            if "Contents" in page:
-                objects.extend([{"Key": obj["Key"]} for obj in page["Contents"]])
-
-        if not objects:
-            return True
-
-        chunk_size = 1000
-        for i in range(0, len(objects), chunk_size):
-            chunk = objects[i : i + chunk_size]
-            s3client.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
-
-        log_success(f"Excluido {src_path}")
+                object_key = clean_string(row[1])
+                if not object_key:
+                    continue
+                    
+                objects_batch.append({"Key": object_key})
+                
+                if len(objects_batch) >= batch_size:
+                    log_info(f"Deletando lote de {len(objects_batch)} objetos")
+                    s3client.delete_objects(Bucket=bucket, Delete={"Objects": objects_batch})
+                    objects_batch = []
+            
+            if objects_batch:
+                log_info(f"Deletando lote final de {len(objects_batch)} objetos")
+                s3client.delete_objects(Bucket=bucket, Delete={"Objects": objects_batch})
+                
+        log_info(f"Arquivo CSV {src_path} removido após processamento")
         return True
-    except botocore.exceptions.ClientError as e:
-        log_error(f"Erro ao excluir objetos: {e}")
+        
+    except FileNotFoundError:
+        log_error(f"Arquivo CSV não encontrado: {src_path}")
+        return False
+    except Exception as e:
+        log_error(f"Erro ao processar arquivo CSV {src_path}: {e}")
         return False
 
-def process_file(file_path: str) -> str:
-    """
-    Process a file and return info needed to archive and delete
-    raw_b_b_short/2024_1_2.csv
+def clean_string(string: str) -> str:
+    return string.strip().replace("\"", "")
 
-    returning "s3://bucket/raw/b/b_short/2024_1_2.csv",
+def build_dst_path(file_path: str, config: Config) -> str:
+    base_name = os.path.basename(file_path)
+    
+    dir_part = os.path.dirname(file_path)
+    if dir_part.startswith('output/'):
+        dir_part = dir_part[7:]
+    
+    transformed_dir = dir_part.replace('.', '/')
+    
+    transformed_path = os.path.join(transformed_dir, base_name)
+    
+    if transformed_path.startswith('/'):
+        transformed_path = transformed_path[1:]
 
-    """
+    return transformed_path
 
-    folder_path = os.path.dirname(file_path)
-    file_name = os.path.basename(file_path)
+def calculate_day_difference(year: int, month: int, day: int) -> int:
+    return (datetime.now() - datetime(year, month, day)).days
 
-    print(f"folder_path: {folder_path}")
-    print(f"file_name: {file_name}")
+def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> str:
+    cursor = db.cursor()
 
-    return f"s3://bucket/{folder_path}/{file_name}"
+    cursor.execute("SELECT DISTINCT destination_path, year, month, day FROM s3_paths WHERE archived = 0 OR (archived = 1 AND deleted = 0)")
+    destination_paths = cursor.fetchall()
 
+    for dst_path in destination_paths:
+        log_info(f"Processing destination path: {dst_path}")
+
+        year, month, day = dst_path[1], dst_path[2], dst_path[3]
+        if day == 1:
+            log_info(f"Ignoring destination path: {dst_path} because day is 1")
+            continue
+        if not calculate_day_difference(year, month, day) > 90:
+            log_info(f"Ignoring destination path: {dst_path} because day is less than 90 days ago")
+            continue
+
+        cursor.execute("SELECT count(*) FROM s3_paths WHERE destination_path = ?", (dst_path[0],))
+        count = cursor.fetchone()[0]
+        log_info(f"Found {count} paths for destination path: {dst_path}")
+
+        if count == 0:
+            log_info(f"No paths found for destination path: {dst_path}, skipping")
+            continue
+
+        cursor.execute("SELECT bucket, path, size, date FROM s3_paths WHERE destination_path = ?", (dst_path[0],))
+        paths = cursor.fetchall()
+
+        temp_csv_path = os.path.join('tmp', f"{dst_path[0].replace('.tar', '.csv')}")
+        os.makedirs(os.path.dirname(temp_csv_path), exist_ok=True)
+        with open(temp_csv_path, 'w') as temp_csv_file:
+            writer = csv.writer(temp_csv_file)
+            for bucket, path, size, date in paths:
+                writer.writerow([bucket, path, size, date])
+
+    
+        archived = archive_object(
+            region=config.region,
+            profile=config.profile,
+            bucket=bucket,
+            dst_path=dst_path[0],
+            src_csv_path=temp_csv_path,
+            deep_archive=config.deep_archive,
+            dry_run=config.dry_run,
+            s3client=s3client,
+        )
+
+        if archived:
+            if not config.dry_run:
+                cursor.execute("UPDATE s3_paths SET archived = 1 WHERE destination_path = ?", (dst_path[0],))
+                db.commit()
+            deleted = delete_object(
+                s3client=s3client,
+                bucket=bucket,
+                src_path=temp_csv_path,
+                delete=config.delete,
+                dry_run=config.dry_run,
+            )
+
+            if deleted:
+                if not config.dry_run:
+                    cursor.execute("UPDATE s3_paths SET deleted = 1 WHERE destination_path = ?", (dst_path[0],))
+                    db.commit()
+
+        os.remove(temp_csv_path)
+        
 
 def main():
     ###### Arguments ######
@@ -171,8 +283,6 @@ def main():
     parser.add_argument("--delete", action="store_true", help="Delete objects after archiving")
     parser.add_argument("--dry-run", action="store_true", help="Simulate only, don't actually archive")
     parser.add_argument("--deep-archive", action="store_true", help="Use DEEP_ARCHIVE storage class")
-    parser.add_argument("--file", type=str, help="Inventory file path (CSV)")
-    parser.add_argument("--all", type=str, help="Add companies to archive")
     parser.add_argument("--profile", type=str, help="AWS profile to use")
     args = parser.parse_args()
 
@@ -180,56 +290,17 @@ def main():
     log_info(f"Configuring AWS with profile {args.profile} and region {args.region}")
     session = boto3.Session(region_name=args.region, profile_name=args.profile)
     s3client = session.client("s3")
+    
+    ########### Cache Setup ###############
+    db = sqlite3.connect("s3_paths.db")
 
-    ########### Setup File ###############
-    files = deque()
+    ########### Setup AWS ###############
+    config = Config()
+    config.load(args)
 
-    if args.file:
-        files.append(process_file(args.file))
-    elif args.all:
-        company_dirs = os.listdir(args.all)
-        for company_dir in company_dirs:
-            files.append(process_file(f"{args.all}/{company_dir}")) 
+    ########### Setup Files ###############
 
-        print(f"files: {files}")
-        return
-
-    else:
-        log_error("Inventory file path is required")
-        return
-
-    print(f"files: {files}")
-
-    return 
-
-    archived = False
-    deleted = False
-
-    ########### Process objects ###############
-    archived = archive_object(
-        region=args.region,
-        profile=args.profile,
-        bucket=args.bucket,
-        dst_path=file_path,
-        src_csv_path=file_path,
-        deep_archive=args.deep_archive,
-        dry_run=args.dry_run,
-    )
-
-    if archived:
-        deleted = delete_object(
-            s3client=s3client,
-            bucket=args.bucket,
-            src_path=file_path,
-            delete=args.delete,
-            dry_run=args.dry_run,
-        )
-
-    if deleted:
-        os.remove(file_path)
-        log_success(f"Archived and deleted {file_path}")
-    else:
-        log_success(f"Archived {file_path}")
+    process(db, config, s3client)
 
 
 if __name__ == "__main__":
