@@ -93,6 +93,12 @@ def archive_object(
     """
     full_dst_path = f"s3://{bucket}/{dst_path}"
 
+    if dry_run:
+        log_dry_run(
+            f"Simulating archiving objects from {src_csv_path} to {full_dst_path}"
+        )
+        return True
+
     try:
         s3client.head_object(Bucket=bucket, Key=full_dst_path)
         log_info(f"Arquivo {full_dst_path} já existe, pulando")
@@ -103,12 +109,6 @@ def archive_object(
         else:
             log_error(f"Erro ao verificar se o arquivo existe: {e}")
             return False
-
-    if dry_run:
-        log_dry_run(
-            f"Simulating archiving objects from {src_csv_path} to {full_dst_path}"
-        )
-        return True
 
     cmd = [
         "s3tar",
@@ -226,14 +226,15 @@ def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> s
     cursor = db.cursor()
 
     cursor.execute(
-        "SELECT DISTINCT destination_path, year, month, day FROM s3_paths WHERE archived = 0 OR (archived = 1 AND deleted = 0)"
+        "SELECT destination_path FROM s3_paths WHERE archived = 0 OR (archived = 1 AND deleted = 0) group by destination_path"
     )
     destination_paths = cursor.fetchall()
 
     for dst_path in destination_paths:
         log_info(f"Processing destination path: {dst_path}")
 
-        year, month, day = dst_path[1], dst_path[2], dst_path[3]
+        date = dst_path[0].split("/")[-1].replace(".tar", "")
+        year, month, day = int(date.split("-")[0]), int(date.split("-")[1]), int(date.split("-")[2])
         if "raw" not in dst_path[0]:
             log_info(f"Ignoring destination path: {dst_path} because day is not raw")
             continue
@@ -244,16 +245,6 @@ def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> s
             log_info(
                 f"Ignoring destination path: {dst_path} because day is less than 90 days ago"
             )
-            continue
-
-        cursor.execute(
-            "SELECT count(*) FROM s3_paths WHERE destination_path = ?", (dst_path[0],)
-        )
-        count = cursor.fetchone()[0]
-        log_info(f"Found {count} paths for destination path: {dst_path}")
-
-        if count == 0:
-            log_info(f"No paths found for destination path: {dst_path}, skipping")
             continue
 
         cursor.execute(
