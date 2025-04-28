@@ -49,19 +49,25 @@ def setup_indexes(db: sqlite3.Connection) -> None:
     Create necessary indexes to improve query performance.
     """
     cursor = db.cursor()
-    
+
     # Index on destination_path (most critical as it's used in multiple queries)
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_destination_path ON s3_paths(destination_path)")
-    
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_destination_path ON s3_paths(destination_path)"
+    )
+
     # Composite index on archived and deleted
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_archived_deleted ON s3_paths(archived, deleted)")
-    
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_archived_deleted ON s3_paths(archived, deleted)"
+    )
+
     # Composite index on year, month, day
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_date_parts ON s3_paths(year, month, day)")
-    
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_date_parts ON s3_paths(year, month, day)"
+    )
+
     # Index on path (since it's used in the UNIQUE constraint)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_path ON s3_paths(path)")
-    
+
     db.commit()
     logging.info("Database indexes created/verified")
 
@@ -136,7 +142,7 @@ def process_s3_csv(
             date_parts = extract_date_parts(normalized_path)
             origin = extract_origin(normalized_path)
             destination_path = (
-                f"archived/{origin}/{date_parts[0]}-{date_parts[1]}-{date_parts[2]}.tar"
+                f"archive/{origin}/{date_parts[0]}-{date_parts[1]}-{date_parts[2]}.tar"
             )
 
             year, month, day = date_parts
@@ -144,6 +150,9 @@ def process_s3_csv(
             date = normalized_row.iloc[3]
 
             try:
+                logging.info(
+                    f"Inserting {normalized_path} {year} {month} {day} {origin} {bucket} {destination_path} {size} {date}"
+                )
                 cursor.execute(
                     "INSERT INTO s3_paths (path, year, month, day, origin, bucket, archived, deleted, destination_path, size, date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
@@ -160,6 +169,7 @@ def process_s3_csv(
                         date,
                     ),
                 )
+
             except sqlite3.IntegrityError as e:
                 if "UNIQUE constraint failed" in str(e):
                     continue
@@ -202,7 +212,7 @@ def main():
 
     setup_logging()
     conn, cursor = setup_sqlite("s3_paths.db")
-    
+
     # Create indexes to improve performance
     setup_indexes(conn)
 
