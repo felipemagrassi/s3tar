@@ -44,6 +44,28 @@ def setup_sqlite(db_path):
     return conn, cursor
 
 
+def setup_indexes(db: sqlite3.Connection) -> None:
+    """
+    Create necessary indexes to improve query performance.
+    """
+    cursor = db.cursor()
+    
+    # Index on destination_path (most critical as it's used in multiple queries)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_destination_path ON s3_paths(destination_path)")
+    
+    # Composite index on archived and deleted
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_archived_deleted ON s3_paths(archived, deleted)")
+    
+    # Composite index on year, month, day
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_date_parts ON s3_paths(year, month, day)")
+    
+    # Index on path (since it's used in the UNIQUE constraint)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_path ON s3_paths(path)")
+    
+    db.commit()
+    logging.info("Database indexes created/verified")
+
+
 def setup_logging(file_path=None):
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -180,6 +202,9 @@ def main():
 
     setup_logging()
     conn, cursor = setup_sqlite("s3_paths.db")
+    
+    # Create indexes to improve performance
+    setup_indexes(conn)
 
     # Process all input files
     for input_file in args.input_files:
