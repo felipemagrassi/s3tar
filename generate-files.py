@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import csv
 import os
 import re
@@ -6,16 +7,41 @@ import argparse
 from collections import defaultdict
 import logging
 from datetime import datetime
+import pandas as pd
 
 
-def setup_logging():
-    """Set up logging configuration"""
+NotificationStatus = {
+    "success": "success",
+    "failed": "failed",
+    "skipped": "skipped",
+}
+
+NotificationReason = {
+    "path_column_missing": "Path column is missing",
+    "path_not_a_raw_path": "Path is not a raw path",
+    "path_newer_than_90_days": "Path is newer than 90 days",
+    "path_day_1": "Path is day 1",
+    "path_invalid": "Path is invalid",
+}
+
+
+def setup_logging(file_path=None):
+    """
+    Set up logging configuration
+    
+    Args:
+        file_path: Optional custom log file path. If None, a default path will be used.
+    """
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"csv_filter_{timestamp}.log")
-
+    
+    if file_path is None:
+        log_file = os.path.join(log_dir, f"csv_filter_{timestamp}.log")
+    else:
+        log_file = file_path
+    
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -55,9 +81,9 @@ def extract_date_parts(filepath):
     return "unknown", "unknown", "unknown"
 
 
-def extract_company(filepath):
+def extract_origin(filepath):
     """
-    Extract the company name from a filepath like:
+    Extract the origin from a filepath like:
     raw/b/b_short/Contact/year%3D2024/month%3D1/day%3D2/appflow/account_1.txt
     or raw/b/b_short/Contact/year=2024/month=1/day=2/appflow/account_1.txt
 
@@ -87,12 +113,13 @@ def get_company_dirname(company_path):
         company_path: The full company path (e.g. 'raw/b/b_short')
         
     Returns:
-        str: A safe directory name (e.g. 'raw_b_b_short')
+        str: A safe directory name that preserves the structure (e.g. 'raw.b.b_short')
     """
-    return company_path.replace("/", "_")
+    # Use dot instead of underscore or dash to avoid confusion with paths containing underscores
+    return company_path.replace("/", ".")
 
 
-def is_within_date_range(year, month, day, max_days_ago=90):
+def newer_than_90_days(year, month, day):
     """
     Check if the date is within the specified range from today
 
@@ -106,234 +133,219 @@ def is_within_date_range(year, month, day, max_days_ago=90):
     file_date = datetime(int(year), int(month), int(day))
     today = datetime.now()
     days_diff = (today - file_date).days
-    return days_diff <= max_days_ago
+    return days_diff <= 90
+
+def detect_csv_dialect(file_path):
+    """
+    Determine the CSV dialect for proper parsing
+    
+    Args:
+        file_path: Path to the CSV file
+        
+    Returns:
+        csv.Dialect: Detected dialect or csv.excel as fallback
+    """
+    try:
+        with open(file_path, 'r', newline='', encoding='utf-8') as f:
+            sample = f.read(8192)
+            dialect = csv.Sniffer().sniff(sample)
+    except (csv.Error, UnicodeDecodeError):
+        dialect = csv.excel  # Fallback to standard CSV format
+    
+    return dialect
+
+def is_raw_path(path):
+    """
+    Check if a path is a raw path
+    """
+    return "raw/" in str(path)
+
+def validate_path(path, statistics, notification):
+    """
+    Validate a path
+    """
+
+    if not is_raw_path(path):
+        statistics["skipped_non_raw"] += 1
+        notification["status"] = NotificationStatus["failed"]
+        notification["reason"] = NotificationReason["path_not_a_raw_path"]
+        return False
+
+    year, month, day = extract_date_parts(path)
+    if newer_than_90_days(year, month, day):
+        statistics["skipped_new_files"] += 1
+        notification["status"] = NotificationStatus["failed"]
+        notification["reason"] = NotificationReason["path_newer_than_90_days"]
+        return False
+
+    if day == "1":
+        statistics["skipped_day_1"] += 1
+        notification["status"] = NotificationStatus["failed"]
+        notification["reason"] = NotificationReason["path_day_1"]
+        return False
+
+    return True
+
+def get_dirname_by_origin(origin):
+    """
+    Get the directory name based on the origin
+    """
+    return origin.replace("/", ".")
+
+def build_failed_file_path(notification, failed_path):
+    """
+    Build the file path for the failed file
+    """
+    reason = None
+    if notification["reason"] == NotificationReason["path_column_missing"]:
+        reason = "missing"
+    elif notification["reason"] == NotificationReason["path_not_a_raw_path"]:
+        reason = "not_raw"
+    elif notification["reason"] == NotificationReason["path_newer_than_90_days"]:
+        reason = "90_days"
+    elif notification["reason"] == NotificationReason["path_day_1"]:
+        reason = "day_1"
+    elif notification["reason"] == NotificationReason["path_invalid"]:
+        reason = "invalid"
+
+    return f"{failed_path}_{reason}.csv"
+
+def append_to_file(row, file_path):
+    """
+    Append a row to a file
+    """
+    if not os.path.exists(os.path.dirname(file_path)):
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    try:
+        with open(file_path, 'a') as f:
+            # Write the row as it appears in the original CSV file
+            if isinstance(row, pd.Series):
+                # Join the values with commas and add a newline
+                line = ','.join([f'"{val}"' if isinstance(val, str) else str(val) for val in row])
+                f.write(line + '\n')
+            else:
+                # If it's already a string (like from file.csv), write it directly
+                if isinstance(row, str):
+                    f.write(row if row.endswith('\n') else row + '\n')
+                else:
+                    # Handle case where row is not a string
+                    f.write(str(row) + '\n')
+    except Exception as e:
+        logging.error(f"Error appending to file {file_path}: {e}")
+    finally:
+        f.close()
 
 
 def process_s3_csv(
-    input_file, output_dir, path_column_idx=1, days_filter=90, batch_size=100000
+    input_file, 
+    output_dir, 
+    path_column_idx=1, 
+    chunk_size=100000
 ):
     """
-    Process a large CSV file with S3 paths and filter by company type and date
+    Process a large CSV file with S3 paths using pandas chunking
     
     Args:
         input_file: Path to the input CSV file
         output_dir: Directory to store the output files
         path_column_idx: Index of the column containing S3 paths (default is 1, 0-indexed)
-        days_filter: Only include files from within this many days (default 90)
-        batch_size: Number of rows to process before writing to files
+        chunk_size: Number of rows to process in each chunk
     """
     os.makedirs(output_dir, exist_ok=True)
     
     # Track statistics
-    total_rows = 0
-    filtered_rows = defaultdict(int)
-    skipped_day1 = 0
-    skipped_new_files = 0
-    output_files = {}
-    file_handles = {}
-    writers = {}
-    skipped_non_raw = 0
-    normalized_count = 0
+    statistics = {
+        "total_rows": 0,
+        "skipped_day_1": 0,
+        "skipped_new_files": 0,
+        "skipped_non_raw": 0,
+        "skipped_invalid_path": 0,
+        "skipped_row": 0,
+        "normalized_count": 0,
+        "filtered_rows": defaultdict(int)
+    }
     
     logging.info(f"Starting to process {input_file}")
     start_time = datetime.now()
-
-    try:
-        with open(input_file, "r", newline="", encoding="utf-8") as csvfile:
-            # Try to determine the CSV dialect
-            try:
-                sample = csvfile.read(8192)
-                csvfile.seek(0)
-                dialect = csv.Sniffer().sniff(sample)
-            except csv.Error:
-                dialect = csv.excel  # Fallback to standard CSV format
-            
-            reader = csv.reader(csvfile, dialect)
-            
-            batch_data = defaultdict(list)
-            
-            for row_num, row in enumerate(reader, 1):
-                if not row or len(row) <= path_column_idx:
-                    continue
-                
-                total_rows += 1
-                filepath = row[path_column_idx]
-                
-                if not "raw/" in filepath:
-                    print(f"Skipping non-raw file: {filepath}")
-                    skipped_non_raw += 1
-                    continue
-                
-                # Normalize the path (replace %3D with =)
-                if "%3D" in filepath:
-                    normalized_path = normalize_path(filepath)
-                    normalized_count += 1
-                else:
-                    normalized_path = filepath
-                
-                row_copy = list(row)
-                row_copy[path_column_idx] = normalized_path
-                
-                year, month, day = extract_date_parts(normalized_path)
-                company = extract_company(normalized_path)
-                
-                # Skip files where day = 1
-                if day == "1":
-                    print(f"Skipping day=1: {normalized_path}")
-                    skipped_day1 += 1
-                    continue
-                
-                # Skip files newer than specified days
-                if is_within_date_range(year, month, day, days_filter):
-                    print(f"Skipping new file: {normalized_path}")
-                    skipped_new_files += 1
-                    continue
-                
-                # Create a combined key with company and date
-                date_key = f"{year}_{month}_{day}"
-                combined_key = f"{company}_{date_key}"
-                company_dir = get_company_dirname(company)
-                company_output_dir = os.path.join(output_dir, company_dir)
-                
-                # Store data using the combined key
-                batch_data[combined_key].append(row_copy)
-                filtered_rows[combined_key] += 1
-
-                if row_num % batch_size == 0:
-                    # Process each company separately
-                    for key in list(batch_data.keys()):
-                        key_parts = key.split('_')
-                        if len(key_parts) >= 4:  # At least company + year + month + day
-                            # Extract company and date parts
-                            company_parts = key_parts[:-3]
-                            company_path = '_'.join(company_parts)
-                            company_dir = get_company_dirname(company_path)
-                            company_output_dir = os.path.join(output_dir, company_dir)
-                            
-                            write_batch(
-                                {key: batch_data[key]},
-                                company_output_dir,
-                                None,
-                                output_files,
-                                file_handles,
-                                writers,
-                                write_header=False,
-                            )
-                    batch_data = defaultdict(list)
-                    logging.info(f"Processed {row_num:,} rows...")
-                
-    except Exception as e:
-        logging.error(f"Error processing CSV: {str(e)}")
-        raise
-    finally:
-        # Write any remaining batched data
-        if batch_data:
-            for key in list(batch_data.keys()):
-                key_parts = key.split('_')
-                if len(key_parts) >= 4:  # At least company + year + month + day
-                    # Extract company and date parts
-                    company_parts = key_parts[:-3]
-                    company_path = '_'.join(company_parts)
-                    company_dir = get_company_dirname(company_path)
-                    company_output_dir = os.path.join(output_dir, company_dir)
-                    
-                    write_batch(
-                        {key: batch_data[key]},
-                        company_output_dir,
-                        None,
-                        output_files,
-                        file_handles,
-                        writers,
-                        write_header=False,
-                    )
-            logging.info(f"Wrote final batch of data")
-            
-        # Close all open file handles
-        for file_handle in file_handles.values():
-            file_handle.close()
     
+    dialect = detect_csv_dialect(input_file)
+    
+    reader = pd.read_csv(
+        input_file, 
+        chunksize=chunk_size,
+        dialect=dialect,
+        skip_blank_lines=True,
+        header=None
+    )
+
+    for chunk in reader:
+        for _, row in chunk.iterrows():
+            notification = {
+                "data": row,
+                "status": None,
+                "file_path": None,
+                "reason": None,
+            }
+            statistics["total_rows"] += 1
+
+            if path_column_idx >= len(row) or pd.isna(row.iloc[path_column_idx]):
+                statistics["skipped_row"] += 1
+                notification["status"] = NotificationStatus["failed"]
+                notification["reason"] = NotificationReason["path_column_missing"]
+
+            normalized_path = normalize_path(row.iloc[path_column_idx])
+            normalized_row = row.copy()
+            normalized_row.iloc[path_column_idx] = normalized_path
+            date_parts = extract_date_parts(normalized_path)
+            origin = extract_origin(normalized_path)
+            folder_name = get_dirname_by_origin(origin)
+
+            file_name = f"{date_parts[0]}.{date_parts[1]}.{date_parts[2]}.csv"
+            full_path = f"{output_dir}/{folder_name}/{file_name}"
+            failed_path = f"{output_dir}/failed/{folder_name}/{file_name}".replace(".csv", "")
+
+            statistics["normalized_count"] += 1
+
+            validate_path(normalized_path, statistics, notification)
+
+            if notification["status"] == NotificationStatus["failed"]:
+                notification["file_path"] = build_failed_file_path(notification, failed_path)
+                append_to_file(normalized_row, notification["file_path"])
+                continue
+
+            if origin == "unknown":
+                statistics["skipped_invalid_path"] += 1
+                notification["status"] = NotificationStatus["failed"]
+                notification["reason"] = NotificationReason["path_invalid"]
+                notification["file_path"] = build_failed_file_path(notification, failed_path)
+                append_to_file(normalized_row, notification["file_path"])
+                continue
+
+            append_to_file(normalized_row, full_path)
+
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
     # Print summary
     logging.info(f"CSV processing complete")
-    logging.info(f"Total rows processed: {total_rows:,}")
-    logging.info(f"Paths normalized (replaced %3D with =): {normalized_count:,}")
-    logging.info(f"Rows skipped (day=1): {skipped_day1:,}")
-    logging.info(f"Rows skipped (newer than {days_filter} days): {skipped_new_files:,}")
-    logging.info(f"Rows skipped (non-raw): {skipped_non_raw:,}")
+    logging.info(f"Total rows processed: {statistics['total_rows']:,}")
+    logging.info(f"Paths normalized (replaced %3D with =): {statistics['normalized_count']:,}")
+
+    logging.info(f"Skipped day 1: {statistics['skipped_day_1']:,}")
+    logging.info(f"Skipped new files: {statistics['skipped_new_files']:,}") 
+    logging.info(f"Skipped non-raw: {statistics['skipped_non_raw']:,}")
+    logging.info(f"Skipped invalid path: {statistics['skipped_invalid_path']:,}")
+    logging.info(f"Skipped row: {statistics['skipped_row']:,}")
+
     logging.info(f"Time taken: {duration:.2f} seconds")
-    logging.info(f"Processing speed: {total_rows / duration:.2f} rows/second")
-    logging.info("Rows per company/date group:")
+    logging.info(f"Processing speed: {statistics['total_rows'] / duration:.2f} rows/second")
     
-    for file_key, count in sorted(
-        filtered_rows.items(), key=lambda x: x[1], reverse=True
-    ):
-        logging.info(
-            f"  {file_key}: {count:,} rows -> {output_files.get(file_key, 'N/A')}"
-        )
-
-
-def write_batch(
-    batch_data,
-    output_dir,
-    headers,
-    output_files,
-    file_handles,
-    writers,
-    write_header=True,
-):
-    """Write batched data to the appropriate output files"""
-    for file_key, rows in batch_data.items():
-        if not rows:
-            continue
-
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-
-        if file_key not in file_handles:
-            # Extract date part from the combined key (last 3 components)
-            key_parts = file_key.split('_')
-            if len(key_parts) >= 4:  # company_year_month_day format
-                # Get the date part for filename
-                date_parts = key_parts[-3:]
-                date_string = f"{date_parts[0]}_{date_parts[1]}_{date_parts[2]}"
-                
-                # Get company name from key but use simplified version for filename
-                # to avoid path duplication
-                filename = f"{date_string}.csv"
-            else:
-                # Fallback in case we can't parse
-                filename = f"{file_key}.csv"
-                
-            # Create new output file for this key
-            output_file = os.path.join(output_dir, filename)
-
-            # Track if this is a new file
-            is_new_file = not os.path.exists(output_file)
-
-            # Open file and create writer
-            file_handle = open(output_file, "a", newline="", encoding="utf-8")
-            writer = csv.writer(file_handle)
-
-            # Write headers only if needed (and is a new file)
-            if write_header and headers and is_new_file:
-                writer.writerow(headers)
-
-            # Store references
-            output_files[file_key] = output_file
-            file_handles[file_key] = file_handle
-            writers[file_key] = writer
-
-        # Write all rows for this file key
-        writers[file_key].writerows(rows)
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter a large CSV file with S3 paths into files based on company and date"
+        description="Filter a large CSV file with S3 paths into files based on origin and date"
     )
-    parser.add_argument("input_file", help="Input CSV file path")
+    parser.add_argument("input_files", nargs='+', help="Input CSV files paths")
     parser.add_argument(
         "--output-dir",
         "-o",
@@ -348,26 +360,28 @@ def main():
         help="Column index (0-based) containing the S3 path",
     )
     parser.add_argument(
-        "--days-filter",
-        "-d",
-        type=int,
-        default=90,
-        help="Only include files from within this many days",
-    )
-    parser.add_argument(
-        "--batch-size", "-b", type=int, default=100000, help="Batch size for processing"
+        "--chunk-size", 
+        "-c", 
+        type=int, 
+        default=100000, 
+        help="Number of rows to process in each chunk"
     )
 
     args = parser.parse_args()
 
     setup_logging()
-    process_s3_csv(
-        args.input_file,
-        args.output_dir,
-        path_column_idx=args.path_column,
-        days_filter=args.days_filter,
-        batch_size=args.batch_size,
-    )
+    
+    # Process all input files
+    for input_file in args.input_files:
+        process_s3_csv(
+            input_file,
+            args.output_dir,
+            path_column_idx=args.path_column,
+            chunk_size=args.chunk_size,
+        )
+
+        print(f"Processed {input_file}")
+        print("\n")
 
 
 if __name__ == "__main__":
