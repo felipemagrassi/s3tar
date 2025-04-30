@@ -19,6 +19,9 @@ class Config:
         self.delete = False
         self.dry_run = False
         self.deep_archive = False
+        self.limit = 0
+        self.archive = False
+
 
     def load(self, args: argparse.Namespace):
         self.bucket = args.bucket
@@ -27,7 +30,8 @@ class Config:
         self.delete = args.delete
         self.dry_run = args.dry_run
         self.deep_archive = args.deep_archive
-
+        self.limit = args.limit if args.limit is not None else 0
+        self.archive = args.archive
     def __str__(self):
         return f"Config(bucket={self.bucket}, region={self.region}, profile={self.profile}, delete={self.delete}, dry_run={self.dry_run}, deep_archive={self.deep_archive})"
 
@@ -41,30 +45,26 @@ logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+def log_query(message: str) -> None:
+    logging.info(f"🔍 QUERY: {message}")
 
 def log_debug(message: str) -> None:
     logging.debug(f"🔍 DEBUG: {message}")
 
-
 def log_info(message: str) -> None:
     logging.info(f"ℹ️ INFO: {message}")
-
 
 def log_success(message: str) -> None:
     logging.info(f"✅ SUCESSO: {message}")
 
-
 def log_warning(message: str) -> None:
     logging.warning(f"⚠️ AVISO: {message}")
-
 
 def log_error(message: str) -> None:
     logging.error(f"❌ ERRO: {message}")
 
-
 def log_dry_run(message: str) -> None:
     logging.info(f"🔬 DRY-RUN: {message}")
-
 
 def archive_object(
     region: str,
@@ -221,49 +221,109 @@ def build_dst_path(file_path: str, config: Config) -> str:
 def calculate_day_difference(year: int, month: int, day: int) -> int:
     return (datetime.now() - datetime(year, month, day)).days
 
-
-def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> str:
+def build_csv(db: sqlite3.Connection, dst_path: str, s3client: boto3.client) -> str:
     cursor = db.cursor()
-
     cursor.execute(
-        "SELECT destination_path FROM s3_paths WHERE archived = 0 OR (archived = 1 AND deleted = 0) group by destination_path"
+        "SELECT bucket, path, size, date FROM s3_paths WHERE destination_path = ?",
+        (dst_path,),
     )
-    destination_paths = cursor.fetchall()
+    paths = cursor.fetchall()
 
+    temp_csv_path = os.path.join("tmp", f"{dst_path[0].replace('.tar', '.csv')}")
+    os.makedirs(os.path.dirname(temp_csv_path), exist_ok=True)
+    with open(temp_csv_path, "w") as temp_csv_file:
+        writer = csv.writer(temp_csv_file)
+        for bucket, path, size, date in paths:
+            if size > 0:
+                writer.writerow([bucket, path, size, date])
+    
+    with open(temp_csv_path, "r") as temp_csv_file:
+        char = temp_csv_file.read(1)
+        if not char:
+            log_info(f"Arquivo {temp_csv_path} vazio, pulando")
+            query = "UPDATE s3_paths SET ignored = 1 WHERE destination_path = ?"
+            cursor.execute(query, (dst_path[0],))
+            db.commit()
+            return None
+        else:
+            return temp_csv_path
+
+def validate_destination_path(db: sqlite3.Connection, destination_path: str) -> bool:
+    cursor = db.cursor()
+    date = destination_path.split("/")[-1].replace(".tar", "")
+    year, month, day = int(date.split("-")[0]), int(date.split("-")[1]), int(date.split("-")[2])
+    if "raw" not in destination_path:
+        log_info(f"Destination path {destination_path} is not a raw path, ignoring")
+        cursor.execute("UPDATE s3_paths SET ignored = 1 WHERE destination_path = ?", (destination_path,))
+        return False
+    if day == 1:
+        log_info(f"Destination path {destination_path} is the first day of the month, ignoring")
+        cursor.execute("UPDATE s3_paths SET ignored = 1 WHERE destination_path = ?", (destination_path,))
+        return False
+    if not calculate_day_difference(year, month, day) > 90:
+        log_info(f"Destination path {destination_path} is not older than 90 days, ignoring")
+        cursor.execute("UPDATE s3_paths SET ignored = 1 WHERE destination_path = ?", (destination_path,))
+        return False
+    return True
+
+def process_delete(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> str:
+    cursor = db.cursor()
+    query = "SELECT destination_path FROM s3_paths WHERE (archived = 1 AND deleted = 0 AND ignored = 0) group by destination_path"
+    log_query(query)
+    cursor.execute(query)
+    destination_paths = cursor.fetchall()
     for dst_path in destination_paths:
         log_info(f"Processing destination path: {dst_path}")
-
-        date = dst_path[0].split("/")[-1].replace(".tar", "")
-        year, month, day = int(date.split("-")[0]), int(date.split("-")[1]), int(date.split("-")[2])
-        if "raw" not in dst_path[0]:
-            log_info(f"Ignoring destination path: {dst_path} because day is not raw")
+        if not validate_destination_path(db, dst_path):
             continue
-        if day == 1:
-            log_info(f"Ignoring destination path: {dst_path} because day is 1")
+        temp_csv_path = build_csv(db, dst_path, s3client)
+        if temp_csv_path is None:
             continue
-        if not calculate_day_difference(year, month, day) > 90:
-            log_info(
-                f"Ignoring destination path: {dst_path} because day is less than 90 days ago"
-            )
-            continue
-
-        cursor.execute(
-            "SELECT bucket, path, size, date FROM s3_paths WHERE destination_path = ?",
-            (dst_path[0],),
+        deleted = delete_object(
+            s3client=s3client,
+            bucket=config.bucket,
+            src_path=temp_csv_path,
+            delete=config.delete,
+            dry_run=config.dry_run,
         )
-        paths = cursor.fetchall()
 
-        temp_csv_path = os.path.join("tmp", f"{dst_path[0].replace('.tar', '.csv')}")
-        os.makedirs(os.path.dirname(temp_csv_path), exist_ok=True)
-        with open(temp_csv_path, "w") as temp_csv_file:
-            writer = csv.writer(temp_csv_file)
-            for bucket, path, size, date in paths:
-                writer.writerow([bucket, path, size, date])
+        if deleted:
+            if not config.dry_run:
+                cursor.execute(
+                    "UPDATE s3_paths SET deleted = 1 WHERE destination_path = ?",
+                    (dst_path[0],),
+                )
+                db.commit()
+
+        os.remove(temp_csv_path)
+
+def process_archive(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> str:
+    cursor = db.cursor()
+    if config.limit > 0:
+        query = f"SELECT destination_path FROM s3_paths WHERE (archived = 0 AND deleted = 0 AND ignored = 0) group by destination_path limit {config.limit}"
+        log_query(query)
+        cursor.execute(
+            query,
+        )
+    else:
+        query = "SELECT destination_path FROM s3_paths WHERE (archived = 0 AND deleted = 0 AND ignored = 0) group by destination_path"
+        log_query(query)
+        cursor.execute(
+            query,
+        )
+    destination_paths = cursor.fetchall()
+    for dst_path in destination_paths:
+        log_info(f"Processing destination path: {dst_path[0]}")
+        if not validate_destination_path(db, dst_path[0]):
+            continue
+        temp_csv_path = build_csv(db, dst_path[0], s3client)
+        if temp_csv_path is None:
+            continue
 
         archived = archive_object(
             region=config.region,
             profile=config.profile,
-            bucket=bucket,
+            bucket=config.bucket,
             dst_path=dst_path[0],
             src_csv_path=temp_csv_path,
             deep_archive=config.deep_archive,
@@ -278,23 +338,16 @@ def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> s
                     (dst_path[0],),
                 )
                 db.commit()
-            deleted = delete_object(
-                s3client=s3client,
-                bucket=bucket,
-                src_path=temp_csv_path,
-                delete=config.delete,
-                dry_run=config.dry_run,
-            )
-
-            if deleted:
-                if not config.dry_run:
-                    cursor.execute(
-                        "UPDATE s3_paths SET deleted = 1 WHERE destination_path = ?",
-                        (dst_path[0],),
-                    )
-                    db.commit()
-
+        
         os.remove(temp_csv_path)
+    
+def process(db: sqlite3.Connection, config: Config, s3client: boto3.client) -> str:
+    if config.archive:
+        process_archive(db, config, s3client)
+    elif config.delete:
+        process_delete(db, config, s3client)
+    else:
+        log_error("Nenhuma ação selecionada")
 
 
 def main():
@@ -314,6 +367,8 @@ def main():
         "--deep-archive", action="store_true", help="Use DEEP_ARCHIVE storage class"
     )
     parser.add_argument("--profile", type=str, help="AWS profile to use")
+    parser.add_argument("--limit", type=int, help="Limit the number of destination paths to process")
+    parser.add_argument("--archive", action="store_true", help="Archive objects")
     args = parser.parse_args()
 
     ############### Setup AWS ###############

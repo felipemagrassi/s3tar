@@ -22,6 +22,7 @@ SQLITE_SCHEMA = {
         "bucket": "TEXT NOT NULL",
         "archived": "INTEGER NOT NULL",
         "deleted": "INTEGER NOT NULL",
+        "ignored": "INTEGER NOT NULL",
         "destination_path": "TEXT NOT NULL",
         "size": "INTEGER NOT NULL",
         "date": "TEXT NOT NULL",
@@ -57,7 +58,7 @@ def setup_indexes(db: sqlite3.Connection) -> None:
 
     # Composite index on archived and deleted
     cursor.execute(
-        "CREATE INDEX IF NOT EXISTS idx_archived_deleted ON s3_paths(archived, deleted)"
+        "CREATE INDEX IF NOT EXISTS idx_archived_deleted ON s3_paths(archived, deleted, ignored)"
     )
 
     # Composite index on year, month, day
