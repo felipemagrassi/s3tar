@@ -1,6 +1,3 @@
-s3/
-*
-!archivev2.py
-!generate-files.py
-!generate.py
+* 
 !delete.py
+!generate.py
