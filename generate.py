@@ -61,10 +61,10 @@ def main():
             notification, valid = filter_path(clean_path(path))
             if valid:
                 with open('valid.csv', 'a') as f:
-                    f.write(f"{bucket},{path}\n")
+                    f.write(f"{bucket},{clean_path(path)}\n")
             else:
                 with open('invalid.csv', 'a') as f:
-                    f.write(f"{bucket},{path},{notification['reason']}\n")
+                    f.write(f"{bucket},{clean_path(path)},{notification['reason']}\n")
 
 
 if __name__ == "__main__":
